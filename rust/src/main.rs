@@ -69,7 +69,10 @@ fn create_receiving_address(rpc: &Client, label: &str) -> bitcoincore_rpc::Resul
 /// see the balance stay at zero for a long stretch and then jump to
 /// positive all at once: block 1 creates the reward, blocks 2-101
 /// mature it.
-fn mine_until_positive_balance(rpc: &Client, mining_addr: &Address) -> bitcoincore_rpc::Result<u64> {
+fn mine_until_positive_balance(
+    rpc: &Client,
+    mining_addr: &Address,
+) -> bitcoincore_rpc::Result<u64> {
     let mut blocks_mined = 0u64;
     while rpc.get_balance(None, None)? == Amount::ZERO {
         rpc.generate_to_address(1, mining_addr)?;
