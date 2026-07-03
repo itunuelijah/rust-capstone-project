@@ -6,15 +6,44 @@ use serde_json::json;
 use std::fs::File;
 use std::io::Write;
 
-// Node access params (regtest defaults).
-const RPC_URL: &str = "http://127.0.0.1:18443";
+// Node access params
+const RPC_URL: &str = "http://127.0.0.1:18443"; // Default regtest RPC port
 const RPC_USER: &str = "alice";
 const RPC_PASS: &str = "password";
 
-/// Bundles every field that ends up in out.txt so we pass one value
-/// around instead of ten loose locals.
+// You can use calls not provided in RPC lib API using the generic `call` function.
+// An example of using the `send` RPC call, which doesn't have exposed API.
+// You can also use serde_json `Deserialize` derivation to capture the returned json result.
+
+/// This function is used to send `amount_in_btc` to `recipient_address` using the `send` RPC call. I call it with
+/// the generic `.call()` method and deserialize only the fields that is needed from the response.
+fn send(
+    rpc: &Client,
+    recipient_address: &str,
+    amount_in_btc: f64,
+) -> bitcoincore_rpc::Result<String> {
+    let args = [
+        json!([{recipient_address : amount_in_btc}]), // recipient address. Instead of hardcoding the amount, it is passed as a parameter to the function.
+        json!(null),                                  // conf target
+        json!(null),                                  // estimate mode
+        json!(null),                                  // fee rate in sats/vb
+        json!(null),                                  // Empty option object
+    ];
+
+    #[derive(Deserialize)]
+    struct SendResult {
+        complete: bool,
+        txid: String,
+    }
+    let send_result = rpc.call::<SendResult>("send", &args)?;
+    assert!(send_result.complete);
+    Ok(send_result.txid)
+}
+
+/// I use this struct to hold every piece of information I need to
+/// write to out.txt, so it can be passed around as a value
 struct TransactionSummary {
-    txid: Txid,
+    transaction_id: Txid,
     miner_input_address: Address,
     miner_input_amount: f64,
     trader_address: Address,
@@ -26,142 +55,127 @@ struct TransactionSummary {
     block_hash: BlockHash,
 }
 
-/// Creates a wallet if it doesn't exist yet; otherwise loads the
-/// existing one. Bitcoin Core errors if you try to create a wallet
-/// that's already on disk, so we treat that as the "load instead" case.
-fn ensure_wallet(rpc: &Client, wallet_name: &str) -> bitcoincore_rpc::Result<()> {
-    match rpc.create_wallet(wallet_name, None, None, None, None) {
+/// This function create a wallet if it doesn't exist yet or load it if it already exists.
+/// So, the error it ought to give serves as a signal to load the existing wallet.
+fn create_wallet(node_client: &Client, wallet_name: &str) -> bitcoincore_rpc::Result<()> {
+    match node_client.create_wallet(wallet_name, None, None, None, None) {
         Ok(_) => println!("Created wallet: {wallet_name}"),
         Err(_) => {
-            // Wallet likely already exists on disk from a previous run —
-            // load it instead of failing.
-            rpc.load_wallet(wallet_name)?;
+            //  Loading the wallet instead of failing.
+            node_client.load_wallet(wallet_name)?;
             println!("Loaded wallet: {wallet_name}");
         }
     }
     Ok(())
 }
 
-/// Builds an RPC client scoped to a specific wallet, e.g.
-/// `.../wallet/Miner`. Every wallet-specific call (balances, addresses,
-/// sends) has to go through a client scoped this way rather than the
-/// base node client.
-fn wallet_client(auth: &Auth, name: &str) -> bitcoincore_rpc::Result<Client> {
-    Client::new(&format!("{RPC_URL}/wallet/{name}"), auth.clone())
+/// This function is to build an RPC client scoped to a specific wallet
+fn wallet_client(authentication: &Auth, wallet_name: &str) -> bitcoincore_rpc::Result<Client> {
+    Client::new(
+        &format!("{RPC_URL}/wallet/{wallet_name}"),
+        authentication.clone(),
+    )
 }
 
-/// Requests a new receiving address from a wallet, tagged with a label
-/// so it's identifiable later (e.g. "Mining Reward", "Received").
-fn create_receiving_address(rpc: &Client, label: &str) -> bitcoincore_rpc::Result<Address> {
-    Ok(rpc.get_new_address(Some(label), None)?.assume_checked())
+/// This function request a new receiving address from a wallet
+fn create_receiving_address(
+    wallet_client: &Client,
+    label: &str,
+) -> bitcoincore_rpc::Result<Address> {
+    Ok(wallet_client
+        .get_new_address(Some(label), None)?
+        .assume_checked())
 }
 
-/// Mines blocks to `mining_addr`, one at a time, until the wallet
-/// balance becomes positive.
-///
-/// Why this takes 101 blocks, not 1:
-/// Every mined block pays a coinbase reward to `mining_addr`, but
-/// coinbase outputs are consensus-locked and cannot be spent until
-/// they have 100 confirmations. Bitcoin Core's wallet only counts a
-/// coinbase output toward the *spendable* balance once it's matured,
-/// so the very first block's reward stays invisible to get_balance
-/// until 100 more blocks have been mined on top of it. That's why we
-/// see the balance stay at zero for a long stretch and then jump to
-/// positive all at once: block 1 creates the reward, blocks 2-101
-/// mature it.
+/// This function mines blocks to mining_address, one at a time, until the wallet balance becomes positive, instead of hardcoding it.
+/// This takes 101 blocks and not just 1 because every block that is mined pays a coinbase reward to `mining_address`, but
+/// coinbase outputs are locked and cannot be spent until they have 100 confirmations. Bitcoin Core's wallet only
+/// counts a coinbase output toward spendable balance once it has matured, therefore, the first block's reward stays invisible to
+/// get_balance until it mined 100 more blocks on top of it.
 fn mine_until_positive_balance(
-    rpc: &Client,
-    mining_addr: &Address,
+    wallet_client: &Client,
+    mining_address: &Address,
 ) -> bitcoincore_rpc::Result<u64> {
-    let mut blocks_mined = 0u64;
-    while rpc.get_balance(None, None)? == Amount::ZERO {
-        rpc.generate_to_address(1, mining_addr)?;
-        blocks_mined += 1;
+    let mut number_of_blocks_mined = 0u64;
+    while wallet_client.get_balance(None, None)? == Amount::ZERO {
+        wallet_client.generate_to_address(1, mining_address)?;
+        number_of_blocks_mined += 1;
     }
-    Ok(blocks_mined)
+    Ok(number_of_blocks_mined)
 }
 
-/// Sends `amount_btc` to `addr` using the `send` RPC call. This isn't
-/// exposed as a typed method on the `bitcoincore-rpc` crate, so we call
-/// it manually and deserialize just the fields we need.
-fn send_payment(rpc: &Client, addr: &Address, amount_btc: f64) -> bitcoincore_rpc::Result<Txid> {
-    #[derive(Deserialize)]
-    struct SendResult {
-        complete: bool,
-        txid: String,
-    }
-
-    let addr_str = addr.to_string();
-    let args = [
-        json!([{ addr_str: amount_btc }]), // recipient address -> amount
-        json!(null),                       // conf target
-        json!(null),                       // estimate mode
-        json!(null),                       // fee rate in sats/vb
-        json!(null),                       // options object
-    ];
-    let result = rpc.call::<SendResult>("send", &args)?;
-    assert!(result.complete, "transaction did not complete");
-    Ok(result.txid.parse().expect("valid txid returned from send"))
-}
-
-/// After the transaction is confirmed, pulls together every detail the
-/// output file needs: the input being spent, which output went to the
-/// Trader, which output is the Miner's own change, the fee, and where
-/// it landed in the chain.
+/// This function gathers every detail out.txt needs, once the transaction has been confirmed.
 fn fetch_transaction_details(
-    rpc: &Client,
-    txid: Txid,
-    trader_addr: &Address,
+    wallet_client: &Client,
+    transaction_id: Txid,
+    trader_address: &Address,
 ) -> bitcoincore_rpc::Result<TransactionSummary> {
-    // Wallet-level view gives us fee and confirmation info directly.
-    let wallet_tx = rpc.get_transaction(&txid, None)?;
-    let fee = wallet_tx.fee.expect("fee present on wallet send").to_btc();
-    let block_height = wallet_tx.info.blockheight.expect("tx confirmed");
-    let block_hash = wallet_tx.info.blockhash.expect("tx confirmed");
+    // I use the wallet-level view of the transaction to get the fee
+    // and confirmation details directly.
+    let wallet_transaction = wallet_client.get_transaction(&transaction_id, None)?;
+    let fee = wallet_transaction
+        .fee
+        .expect("I expect a fee to be present on a wallet-initiated send")
+        .to_btc();
+    let block_height = wallet_transaction
+        .info
+        .blockheight
+        .expect("I expect the transaction to be confirmed at this point");
+    let block_hash = wallet_transaction
+        .info
+        .blockhash
+        .expect("I expect the transaction to be confirmed at this point");
 
-    // Raw transaction gives us the actual inputs/outputs to inspect.
-    let raw_tx_info = rpc.get_raw_transaction_info(&txid, None)?;
+    // I use the raw transaction to inspect the actual inputs and
+    // outputs.
+    let raw_transaction_info = wallet_client.get_raw_transaction_info(&transaction_id, None)?;
 
-    // Resolve the Miner's input: our tx has exactly one input, which
-    // references a previous transaction's output — look that output up
-    // to find the address and amount that funded this send.
-    let vin = &raw_tx_info.vin[0];
-    let prev_txid = vin.txid.expect("non-coinbase input");
-    let prev_vout = vin.vout.expect("non-coinbase input");
-    let prev_tx_info = rpc.get_raw_transaction_info(&prev_txid, None)?;
-    let prev_out = &prev_tx_info.vout[prev_vout as usize];
-    let miner_input_address = prev_out
+    //  The Miner's input address is resolved. The transaction has
+    // exactly one input which tells previous output it spends (a transaction id and an output index)
+    //  So it look up that previous transaction to find the address and amount that funded this send.
+    let first_input = &raw_transaction_info.vin[0];
+    let previous_transaction_id = first_input
+        .txid
+        .expect("I expect a non-coinbase input here");
+    let previous_output_index = first_input
+        .vout
+        .expect("I expect a non-coinbase input here");
+    let previous_transaction_info =
+        wallet_client.get_raw_transaction_info(&previous_transaction_id, None)?;
+    let previous_output = &previous_transaction_info.vout[previous_output_index as usize];
+    let miner_input_address = previous_output
         .script_pub_key
         .address
         .clone()
-        .expect("address on prev output")
+        .expect("I expect an address on the previous output")
         .assume_checked();
-    let miner_input_amount = prev_out.value.to_btc();
+    let miner_input_amount = previous_output.value.to_btc();
 
-    // Our tx has two outputs: the 20 BTC payment to Trader, and the
-    // Miner's change. Whichever output isn't Trader's address must be
-    // the change going back to Miner.
+    // Loop through the two outputs of the transaction: the 20
+    // BTC payment to the Trader, and the Miner's own change. Whichever
+    // output address is not the Trader's address must be the change
+    // going back to the Miner.
     let mut trader_amount = 0.0;
     let mut change_address = None;
     let mut change_amount = 0.0;
-    for vout in &raw_tx_info.vout {
-        if let Some(addr) = &vout.script_pub_key.address {
-            let addr = addr.clone().assume_checked();
-            if &addr == trader_addr {
-                trader_amount = vout.value.to_btc();
+    for output in &raw_transaction_info.vout {
+        if let Some(output_address) = &output.script_pub_key.address {
+            let output_address = output_address.clone().assume_checked();
+            if &output_address == trader_address {
+                trader_amount = output.value.to_btc();
             } else {
-                change_address = Some(addr);
-                change_amount = vout.value.to_btc();
+                change_address = Some(output_address);
+                change_amount = output.value.to_btc();
             }
         }
     }
-    let change_address = change_address.expect("change output present");
+    let change_address = change_address.expect("I expect a change output to be present");
 
     Ok(TransactionSummary {
-        txid,
+        transaction_id,
         miner_input_address,
         miner_input_amount,
-        trader_address: trader_addr.clone(),
+        trader_address: trader_address.clone(),
         trader_amount,
         change_address,
         change_amount,
@@ -171,67 +185,73 @@ fn fetch_transaction_details(
     })
 }
 
-/// Writes the summary to out.txt, one field per line, in the exact
-/// order the grader expects.
-fn write_output(path: &str, summary: &TransactionSummary) -> bitcoincore_rpc::Result<()> {
-    let mut file = File::create(path)?;
-    writeln!(file, "{}", summary.txid)?;
-    writeln!(file, "{}", summary.miner_input_address)?;
-    writeln!(file, "{}", summary.miner_input_amount)?;
-    writeln!(file, "{}", summary.trader_address)?;
-    writeln!(file, "{}", summary.trader_amount)?;
-    writeln!(file, "{}", summary.change_address)?;
-    writeln!(file, "{}", summary.change_amount)?;
-    writeln!(file, "{}", summary.fee)?;
-    writeln!(file, "{}", summary.block_height)?;
-    writeln!(file, "{}", summary.block_hash)?;
+/// This writes the transaction summary to out.txt, with one field per line
+fn write_output(
+    output_file_path: &str,
+    transaction_summary: &TransactionSummary,
+) -> bitcoincore_rpc::Result<()> {
+    let mut output_file = File::create(output_file_path)?;
+    writeln!(output_file, "{}", transaction_summary.transaction_id)?;
+    writeln!(output_file, "{}", transaction_summary.miner_input_address)?;
+    writeln!(output_file, "{}", transaction_summary.miner_input_amount)?;
+    writeln!(output_file, "{}", transaction_summary.trader_address)?;
+    writeln!(output_file, "{}", transaction_summary.trader_amount)?;
+    writeln!(output_file, "{}", transaction_summary.change_address)?;
+    writeln!(output_file, "{}", transaction_summary.change_amount)?;
+    writeln!(output_file, "{}", transaction_summary.fee)?;
+    writeln!(output_file, "{}", transaction_summary.block_height)?;
+    writeln!(output_file, "{}", transaction_summary.block_hash)?;
     Ok(())
 }
 
 fn main() -> bitcoincore_rpc::Result<()> {
-    let auth = Auth::UserPass(RPC_USER.to_owned(), RPC_PASS.to_owned());
-    let base_rpc = Client::new(RPC_URL, auth.clone())?;
+    // Connect to Bitcoin Core RPC
+    let authentication = Auth::UserPass(RPC_USER.to_owned(), RPC_PASS.to_owned());
+    let rpc = Client::new(RPC_URL, authentication.clone())?;
 
-    // --- Wallet initialization ---
-    // Both wallets must exist before we can scope clients to them.
-    ensure_wallet(&base_rpc, "Miner")?;
-    ensure_wallet(&base_rpc, "Trader")?;
-    let miner_rpc = wallet_client(&auth, "Miner")?;
-    let trader_rpc = wallet_client(&auth, "Trader")?;
+    // Get blockchain info
+    let blockchain_info = rpc.get_blockchain_info()?;
+    println!("Blockchain Info: {:?}", blockchain_info);
+
+    // Create/Load the wallets, named 'Miner' and 'Trader'. Have logic to optionally create/load them if they do not exist or not loaded already.
+    create_wallet(&rpc, "Miner")?;
+    create_wallet(&rpc, "Trader")?;
+    let miner_wallet_client = wallet_client(&authentication, "Miner")?;
+    let trader_wallet_client = wallet_client(&authentication, "Trader")?;
     println!("Wallets ready.");
 
-    // --- Mining ---
-    // Mine to a fresh Miner address until its wallet balance turns
-    // positive (see mine_until_positive_balance for why this takes
-    // 101 blocks, not 1).
-    let mining_addr = create_receiving_address(&miner_rpc, "Mining Reward")?;
-    let blocks_mined = mine_until_positive_balance(&miner_rpc, &mining_addr)?;
-    println!("Mined {blocks_mined} blocks before balance turned positive.");
-    println!("Miner balance: {}", miner_rpc.get_balance(None, None)?);
+    // Generate spendable balances in the Miner wallet. How many blocks needs to be mined?
+    let mining_address = create_receiving_address(&miner_wallet_client, "Mining Reward")?;
+    let number_of_blocks_mined =
+        mine_until_positive_balance(&miner_wallet_client, &mining_address)?;
+    println!("Mined {number_of_blocks_mined} blocks before balance turned positive.");
+    println!(
+        "Miner balance: {}",
+        miner_wallet_client.get_balance(None, None)?
+    );
 
-    // --- Transaction creation ---
-    // Get a Trader address to receive funds, then send 20 BTC to it.
-    let trader_addr = create_receiving_address(&trader_rpc, "Received")?;
-    println!("Trader address: {trader_addr}");
-    let txid = send_payment(&miner_rpc, &trader_addr, 20.0)?;
+    // Load Trader wallet and generate a new address
+    let trader_address = create_receiving_address(&trader_wallet_client, "Received")?;
+    println!("Trader address: {trader_address}");
+
+    // Send 20 BTC from Miner to Trader
+    let txid: Txid = send(&miner_wallet_client, &trader_address.to_string(), 20.0)?
+        .parse()
+        .expect("I expect a valid transaction id to be returned from send");
     println!("Broadcast tx: {txid}");
 
-    // --- Mempool check ---
-    // Before it's confirmed, the transaction should be visible in the
-    // node's mempool. Print the whole entry, as the assignment asks.
-    let mempool_entry = miner_rpc.get_mempool_entry(&txid)?;
+    // Check transaction in mempool
+    let mempool_entry = miner_wallet_client.get_mempool_entry(&txid)?;
     println!("Mempool entry: {mempool_entry:#?}");
 
-    // --- Transaction confirmation ---
-    // Mine one block to confirm it.
-    let confirm_blocks = miner_rpc.generate_to_address(1, &mining_addr)?;
+    // Mine 1 block to confirm the transaction
+    let confirm_blocks = miner_wallet_client.generate_to_address(1, &mining_address)?;
     println!("Confirmed in block: {}", confirm_blocks[0]);
 
-    // --- Transaction inspection ---
-    // Pull together everything out.txt needs to describe the tx.
-    let summary = fetch_transaction_details(&miner_rpc, txid, &trader_addr)?;
+    // Extract all required transaction details
+    let summary = fetch_transaction_details(&miner_wallet_client, txid, &trader_address)?;
 
-    // --- Output generation ---
+    // Write the data to ../out.txt in the specified format given in readme.md
     write_output("../out.txt", &summary)?;
     println!("Wrote transaction details to ../out.txt");
 
